@@ -1,0 +1,339 @@
+# =============================================================================
+# miriel-cp314-wheels.yml - Miriel: Python 3.14 macOS arm64 wheel -> CodeArtifact
+#
+# Orbbec publishes no cp314 wheels. Every day this workflow checks for a new
+# upstream v2 release of orbbec/pyorbbecsdk. When there is one, it
+# cherry-picks our cp314 patch (orbbec/pyorbbecsdk#219) onto the release tag,
+# builds pyorbbecsdk2 for CPython 3.14 on macOS arm64, checks that the wheel
+# imports and bundles the OrbbecSDK EULA, then uploads it to Miriel's PRIVATE
+# CodeArtifact index. If the patch no longer applies, it opens an issue
+# instead of building.
+#
+# DISTRIBUTION: Orbbec's EULA forbids distributing the Extension Library on a
+# standalone basis, so the wheel goes only to the private index. This repo is
+# PUBLIC, so the wheel must never leave the runner any other way:
+#   - no actions/upload-artifact (artifacts on public repos are downloadable)
+#   - no release assets
+#   - no Actions cache (fork PR runs can restore caches from the base branch)
+#
+# AWS auth is GitHub OIDC only (no stored keys). The role trusts only this
+# repo's v2-main ref; see miriel-infra terraform/dev/codeartifact/github_publish.tf.
+# =============================================================================
+name: Miriel cp314 wheels
+
+on:
+  schedule:
+    - cron: "23 9 * * *" # daily, 09:23 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (e.g. v2.1.4). Empty = latest upstream v2 release."
+        required: false
+        default: ""
+        type: string
+      publish:
+        description: "Upload to CodeArtifact (untick to build and verify only)."
+        required: false
+        default: true
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: miriel-cp314-wheels
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: orbbec/pyorbbecsdk
+  # Our cp314 patch (head of feat/python-3.14-wheels, orbbec/pyorbbecsdk#219).
+  # Bump this when the PR branch changes.
+  PATCH_COMMIT: de542868ada0c7a1afded6732a3608e0c0506f7b
+  PATCH_BRANCH: feat/python-3.14-wheels
+  PYTHON_VERSION: "3.14"
+  PACKAGE: pyorbbecsdk2
+  AWS_REGION: us-east-2
+  AWS_ROLE_ARN: arn:aws:iam::782292091296:role/miriel-ai-gha-codeartifact-pyorbbecsdk
+  CA_DOMAIN: miriel
+  CA_DOMAIN_OWNER: "782292091296"
+  CA_REPOSITORY: python
+
+jobs:
+  # ------------------------------------------------------------------
+  # Is there a new upstream release, and does our patch apply to it?
+  # ------------------------------------------------------------------
+  check:
+    name: Check upstream release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # OIDC -> AWS (list published versions)
+      issues: write # report a patch that no longer applies
+    outputs:
+      tag: ${{ steps.upstream.outputs.tag }}
+      version: ${{ steps.upstream.outputs.version }}
+      build: ${{ steps.patch.outputs.status == 'ok' && steps.decide.outputs.build == 'true' }}
+    steps:
+      - name: Resolve upstream tag
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            TAG="$INPUT_TAG"
+          else
+            # Latest published (non-draft, non-prerelease) vX.Y.Z release on the v2 line.
+            TAG=$(gh api "repos/${UPSTREAM_REPO}/releases?per_page=100" --jq '
+              [ .[] | select(.draft | not) | select(.prerelease | not) | .tag_name
+                | select(test("^v2\\.[0-9]+\\.[0-9]+$")) ]
+              | sort_by(ltrimstr("v") | split(".") | map(tonumber)) | last // empty')
+          fi
+          if ! [[ "$TAG" =~ ^v2\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::No usable upstream v2 tag (got '${TAG}')"
+            exit 1
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          echo "Upstream tag: ${TAG}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-pyorbbecsdk-check-${{ github.run_id }}
+
+      - name: Compare with CodeArtifact
+        id: decide
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if PUBLISHED=$(aws codeartifact list-package-versions \
+                --domain "$CA_DOMAIN" --domain-owner "$CA_DOMAIN_OWNER" \
+                --repository "$CA_REPOSITORY" --format pypi --package "$PACKAGE" \
+                --query 'versions[].version' --output text 2>"$RUNNER_TEMP/ca.err"); then
+            :
+          elif grep -q ResourceNotFoundException "$RUNNER_TEMP/ca.err"; then
+            PUBLISHED=""
+          else
+            cat "$RUNNER_TEMP/ca.err" >&2
+            exit 1
+          fi
+          PUBLISHED=$(printf '%s\n' $PUBLISHED | sed '/^None$/d;/^$/d' | sort -V)
+          echo "Published ${PACKAGE} versions: $(echo $PUBLISHED)"
+          NEWEST=$(printf '%s\n' $PUBLISHED | tail -n1)
+
+          BUILD=true
+          if printf '%s\n' $PUBLISHED | grep -qxF "$VERSION"; then
+            BUILD=false; REASON="${VERSION} is already in CodeArtifact"
+          elif [ -z "${INPUT_TAG:-}" ] && [ -n "$NEWEST" ] && \
+               [ "$(printf '%s\n%s\n' "$NEWEST" "$VERSION" | sort -V | tail -n1)" != "$VERSION" ]; then
+            # Scheduled runs only move forward. Backfill an older tag with a manual dispatch.
+            BUILD=false; REASON="${VERSION} is older than the newest published version (${NEWEST})"
+          else
+            REASON="${VERSION} is not in CodeArtifact"
+          fi
+          echo "build=${BUILD}" >> "$GITHUB_OUTPUT"
+          echo "${REASON}; build=${BUILD}"
+          echo "**${PACKAGE} ${VERSION}**: ${REASON} (build=${BUILD})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout fork
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Try cp314 patch on upstream tag
+        id: patch
+        if: steps.decide.outputs.build == 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898699+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags --quiet "https://github.com/${UPSTREAM_REPO}.git" "+refs/tags/${TAG}:refs/tags/${TAG}"
+          git fetch --no-tags --quiet origin "${PATCH_BRANCH}" || true
+          git cat-file -e "${PATCH_COMMIT}^{commit}" || { echo "::error::Patch commit ${PATCH_COMMIT} not found"; exit 1; }
+          git checkout --quiet --detach "refs/tags/${TAG}"
+
+          if git merge-base --is-ancestor "$PATCH_COMMIT" HEAD; then
+            echo "Patch is already part of ${TAG}"
+          elif git cherry-pick --no-commit "$PATCH_COMMIT"; then
+            echo "Patch applies cleanly to ${TAG}"
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt" || true
+            git cherry-pick --abort 2>/dev/null || git reset --quiet --hard
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            echo "::warning::cp314 patch does not apply cleanly to ${TAG}"
+            exit 0
+          fi
+
+          PYPROJECT_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -n1)
+          if [ "$PYPROJECT_VERSION" != "$VERSION" ]; then
+            echo "::error::pyproject.toml version (${PYPROJECT_VERSION}) does not match tag ${TAG}"
+            exit 1
+          fi
+          echo "status=ok" >> "$GITHUB_OUTPUT"
+
+      - name: Open issue (patch conflict)
+        if: steps.patch.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.upstream.outputs.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE="cp314 patch does not apply to upstream ${TAG}"
+          EXISTING=$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"${TITLE}\" in:title" --json number --jq '.[0].number // empty') || {
+            echo "::error::Could not query issues on ${GITHUB_REPOSITORY} (are Issues enabled?). ${TITLE}"
+            exit 1
+          }
+          if [ -n "$EXISTING" ]; then
+            echo "Issue #${EXISTING} already open"
+            exit 0
+          fi
+          {
+            echo "The scheduled cp314 wheel build could not cherry-pick \`${PATCH_COMMIT}\` (\`${PATCH_BRANCH}\`) onto upstream \`${TAG}\`, so nothing was built or published."
+            echo
+            echo "Conflicting files:"
+            echo '```'
+            cat "$RUNNER_TEMP/conflicts.txt" 2>/dev/null || true
+            echo '```'
+            echo
+            echo "To fix: rebase \`${PATCH_BRANCH}\` onto \`${TAG}\` (or the upstream branch it came from), update \`PATCH_COMMIT\` in \`.github/workflows/miriel-cp314-wheels.yml\`, then re-run the workflow with tag \`${TAG}\`."
+            echo
+            echo "Run: ${RUN_URL}"
+          } > "$RUNNER_TEMP/issue.md"
+          gh issue create -R "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$RUNNER_TEMP/issue.md" || {
+            echo "::error::Could not open an issue on ${GITHUB_REPOSITORY} (are Issues enabled?). ${TITLE}"
+            exit 1
+          }
+
+  # ------------------------------------------------------------------
+  # Build the cp314 wheel, verify it, and upload to CodeArtifact.
+  # ------------------------------------------------------------------
+  build:
+    name: Build cp314 macOS arm64 wheel
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-latest # arm64
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # OIDC -> AWS (publish)
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+      UV_LINK_MODE: copy
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Apply cp314 patch to upstream tag
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898699+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags --quiet "https://github.com/${UPSTREAM_REPO}.git" "+refs/tags/${TAG}:refs/tags/${TAG}"
+          git fetch --no-tags --quiet origin "${PATCH_BRANCH}" || true
+          git checkout --quiet --detach "refs/tags/${TAG}"
+          if ! git merge-base --is-ancestor "$PATCH_COMMIT" HEAD; then
+            git cherry-pick --no-commit "$PATCH_COMMIT"
+          fi
+          git status --short
+
+      - name: Install build dependencies
+        run: brew install cmake libusb
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          enable-cache: "false" # public repo: keep build outputs out of the Actions cache
+
+      - name: Build wheel
+        run: bash scripts/build_whl/build-whl-uv-macos.sh --yes "$PYTHON_VERSION"
+
+      - name: Verify wheel (tag, EULA, import)
+        id: wheel
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          WHEELS=(wheel/${PACKAGE}-${VERSION}-cp314-cp314-macosx_*_arm64.whl)
+          if [ "${#WHEELS[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one ${PACKAGE}-${VERSION} cp314 macOS arm64 wheel"
+            ls -la wheel || true
+            exit 1
+          fi
+          WHEEL="${WHEELS[0]}"
+          echo "Wheel: ${WHEEL}"
+
+          # The OrbbecSDK EULA must ship inside the wheel.
+          if ! unzip -Z1 "$WHEEL" | grep -qx 'pyorbbecsdk/licenses/LICENSE.txt'; then
+            echo "::error::pyorbbecsdk/licenses/LICENSE.txt is missing from the wheel"
+            exit 1
+          fi
+          cmp <(unzip -p "$WHEEL" pyorbbecsdk/licenses/LICENSE.txt) sdk/LICENSE.txt
+
+          # Import from a clean 3.14 venv, outside the source tree.
+          uv venv "$RUNNER_TEMP/verify" --python "$PYTHON_VERSION"
+          uv pip install --python "$RUNNER_TEMP/verify/bin/python" "$WHEEL"
+          (cd "$RUNNER_TEMP" && "$RUNNER_TEMP/verify/bin/python" - "$VERSION" <<'PY'
+          import sys
+          import pyorbbecsdk
+          assert sys.version_info[:2] == (3, 14), sys.version
+          assert pyorbbecsdk.__version__ == sys.argv[1], pyorbbecsdk.__version__
+          for name in ("Context", "Pipeline", "Config"):
+              assert hasattr(pyorbbecsdk, name), name
+          print("import OK:", pyorbbecsdk.__file__, pyorbbecsdk.__version__)
+          PY
+          )
+
+          SHA256=$(shasum -a 256 "$WHEEL" | cut -d' ' -f1)
+          echo "path=${WHEEL}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ${PACKAGE} ${VERSION} (upstream ${TAG})"
+            echo "- wheel: \`$(basename "$WHEEL")\`"
+            echo "- sha256: \`${SHA256}\`"
+            echo "- EULA bundled: yes; import check: passed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # NEVER add actions/upload-artifact here: this repo is public, and the
+      # Orbbec EULA forbids redistributing the SDK's Extension Library.
+
+      # AWS credentials are fetched only after all build/verify code has run.
+      - name: Configure AWS credentials (OIDC)
+        if: github.event_name == 'schedule' || inputs.publish
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-pyorbbecsdk-publish-${{ github.run_id }}
+
+      - name: Publish to CodeArtifact
+        if: github.event_name == 'schedule' || inputs.publish
+        env:
+          WHEEL: ${{ steps.wheel.outputs.path }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(aws codeartifact get-authorization-token \
+            --domain "$CA_DOMAIN" --domain-owner "$CA_DOMAIN_OWNER" \
+            --duration-seconds 900 --query authorizationToken --output text)
+          echo "::add-mask::${TOKEN}"
+          ENDPOINT=$(aws codeartifact get-repository-endpoint \
+            --domain "$CA_DOMAIN" --domain-owner "$CA_DOMAIN_OWNER" \
+            --repository "$CA_REPOSITORY" --format pypi \
+            --query repositoryEndpoint --output text)
+          TWINE_USERNAME=aws TWINE_PASSWORD="$TOKEN" \
+            uvx --from 'twine>=6,<7' twine upload --non-interactive \
+            --repository-url "$ENDPOINT" "$WHEEL"
+          echo "- published to CodeArtifact \`${CA_DOMAIN}/${CA_REPOSITORY}\`" >> "$GITHUB_STEP_SUMMARY"
